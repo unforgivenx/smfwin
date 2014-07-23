@@ -1,0 +1,641 @@
+#include "ros/ros.h"
+#include "smfwin/roswin_server.h"
+#include "std_msgs/String.h"
+#include "std_msgs/Float32.h"
+#include "std_msgs/UInt32.h"
+#include "Node.h"
+#include <topic_tools/shape_shifter.h>
+#include <sensor_msgs/LaserScan.h>
+#include <rosbag/message_instance.h>
+#include <ros/serialization.h>
+#include <sstream>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <algorithm>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/epoll.h>
+#include <errno.h>
+#include <cstring>
+
+#define MAXEVENTS 64
+
+using namespace std;
+using namespace ros;
+using namespace ros::serialization;
+using namespace topic_tools;
+using std::memcpy;
+
+std::vector<Node> clients;
+
+float Float(char unsigned *const p)
+{
+	float val;
+
+	memcpy(&val,p,sizeof val);
+
+	return val;
+}
+
+
+static int make_socket_non_blocking (int sfd)
+{
+  int flags, s;
+
+  flags = fcntl (sfd, F_GETFL, 0);
+  if (flags == -1)
+    {
+      perror ("fcntl");
+      return -1;
+    }
+
+  flags |= O_NONBLOCK;
+  s = fcntl (sfd, F_SETFL, flags);
+  if (s == -1)
+    {
+      perror ("fcntl");
+      return -1;
+    }
+
+  return 0;
+}
+
+static int create_and_bind (char *port)
+{
+  struct addrinfo hints;
+  struct addrinfo *result, *rp;
+  int s, sfd;
+
+  memset (&hints, 0, sizeof (struct addrinfo));
+  hints.ai_family = AF_UNSPEC;     /* Return IPv4 and IPv6 choices */
+  hints.ai_socktype = SOCK_STREAM; /* We want a TCP socket */
+  hints.ai_flags = AI_PASSIVE;     /* All interfaces */
+
+  s = getaddrinfo (NULL, port, &hints, &result);
+  if (s != 0)
+    {
+      fprintf (stderr, "getaddrinfo: %s\n", gai_strerror (s));
+      return -1;
+    }
+
+  for (rp = result; rp != NULL; rp = rp->ai_next)
+    {
+      sfd = socket (rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+      if (sfd == -1)
+        continue;
+
+      s = bind (sfd, rp->ai_addr, rp->ai_addrlen);
+      if (s == 0)
+        {
+          /* We managed to bind successfully! */
+          break;
+        }
+
+      close (sfd);
+    }
+
+  if (rp == NULL)
+    {
+      fprintf (stderr, "Could not bind\n");
+      return -1;
+    }
+
+  freeaddrinfo (result);
+
+  return sfd;
+}
+
+
+std_msgs::String msg;
+bool success;
+
+void messageCallbackLoopback(const topic_tools::ShapeShifter::ConstPtr& msg)
+   {
+     try {
+       std_msgs::String::Ptr s = msg->instantiate<std_msgs::String>();
+       printf("Got data: %s \n", s->data.c_str());
+       if (s->data == "abc123")
+         success = true;
+     } catch (topic_tools::ShapeShifterException& e)
+     {
+         printf("Instantiate failed!\n");
+     }
+   }
+
+/*std::map<std::string, ros::Publisher> mPublishers;
+ros::Publisher getPublisher(const std::string& topic, MessageInstance &m)
+ {
+	 if (mPublishers.find(topic) == mPublishers.end())
+	 {
+		ros::AdvertiseOptions opts = createAdvertiseOptions(m, 10);
+		ros::NodeHandle mNh;
+		mPublishers[topic] = mNh.advertise(opts);
+	  }
+ return mPublishers[topic];
+}*/
+
+const char* ShapeShifterGetDataType(const ShapeShifter::ConstPtr message)
+{
+        string info = message->getDataType();
+
+        char* result = new char[info.size() + 1];
+        strcpy(result, info.c_str());
+        return result;
+}
+const char* ShapeShifterGetDefinition(const ShapeShifter::ConstPtr message)
+{
+        string info = message->getMessageDefinition();
+
+        char* result = new char[info.size() + 1];
+        strcpy(result, info.c_str());
+        return result;
+}
+unsigned char* ShapeShifterGetData(const ShapeShifter::ConstPtr message)
+{
+        unsigned char* data = new unsigned char[message->size()];
+
+        OStream stream(data, message->size());
+        message->write(stream);
+
+        return data;
+}
+
+
+unsigned int ShapeShifterGetDataLength(const ShapeShifter::ConstPtr message)
+{
+        return message->size();
+}
+
+void distributeMessage(std::string msgtype, std::string msgdata, std::string msgts, int fd) {
+
+	std::vector<std::string>::iterator it;
+	for(std::vector<Node>::size_type i = 0; i != clients.size(); i++) {
+		if (clients[i].getListens().size()>0)
+		{
+			it = std::find(clients[i].getListens().begin(), clients[i].getListens().end(), msgtype );
+			if (it != clients[i].getListens().end() && fd != clients[i].getSocketID())
+			{
+				//ROS_INFO("a");
+				std::string smfmsg;
+				smfmsg = "<SMFPacket>\n";
+				smfmsg += "<Type>" + msgtype + "</Type>\n";
+				smfmsg += "<Data>" + msgdata + "</Data>\n";
+				smfmsg += "<TimeStamp>" + msgts + "</TimeStamp>\n";
+				smfmsg += "</SMFPacket>\n";
+				write (clients[i].getSocketID(), smfmsg.c_str(), smfmsg.length());
+			}
+			else
+			{
+				//ROS_INFO("b");
+			}
+		}
+	}
+}
+
+
+void callback(const ros::MessageEvent<topic_tools::ShapeShifter const>& event)
+{
+	const std::string& publisher_name = event.getPublisherName();
+	ros::M_string header = event.getConnectionHeader();
+	ros::Time receipt_time = event.getReceiptTime();
+	const topic_tools::ShapeShifter::ConstPtr& msg = event.getMessage();
+
+	unsigned char* mdata = ShapeShifterGetData(msg);
+	int dlen = ShapeShifterGetDataLength(msg);
+
+	uint32_t serial_size = ros::serialization::serializationLength( *msg ) ;
+	boost::shared_array< uint8_t > buffer( new uint8_t[ serial_size ] ) ;
+
+	ros::serialization::OStream stream( buffer.get(), serial_size ) ;
+	ros::serialization::serialize( stream, *msg ) ;
+
+	ros::M_string::iterator it = header.find("type");
+	std::string mtype = it->second;
+
+	it = header.find("message_definition");
+	std::string mdef = it->second;
+
+	it = header.find("topic");
+	std::string mtopic = it->second;
+
+	mtopic = mtopic.substr(1, mtopic.size()-1);
+
+	std::stringstream ss;
+	std::string msgts("");
+
+	try {
+
+		  if (mtype == "std_msgs/String")
+		  {
+			  //cout << "The message type was string!\n";
+			  std_msgs::String::Ptr s = msg->instantiate<std_msgs::String>();
+			  ss << *s;
+			  distributeMessage(mtopic, ss.str(), msgts, 0);
+			  //cout << "DATA:\n" << *s;
+		  }
+		  else if (mtype == "sensor_msgs/LaserScan")
+		  {
+			  //cout << "The message type was Laser!\n";
+			  sensor_msgs::LaserScan::Ptr s = msg->instantiate<sensor_msgs::LaserScan>();
+			  ss << *s;
+			  distributeMessage(mtopic, ss.str(), msgts, 0);
+			  //cout << "DATA:\n" << *s;
+		  }
+		  else
+		  {
+			  //cout << "You didn't type in 1 or 2!\n";
+		  }
+
+
+
+
+  //rosbag::MessageInstance m = msg;
+
+  //const sensor_msgs::PointCloud2& input = event.getMessage();
+
+  /*for (int i = 0; i < dlen; i++)
+	  cout << (int)mdata[i] << " ";
+  printf("F: %f\n", Float(mdata));
+
+  for (int i = 0; i < serial_size; i++)
+  	  cout << (int)buffer[i] << " ";
+    printf("\n");*/
+
+  //std::string s = ss.str();
+	  		//msgs.data = ss.str();
+  //printf("M Def: %s, len: %d \n", s.c_str(), dlen);
+
+  //ros::Publisher pub = getPublisher(connection_info->topic, m);
+  //pub.publish(m);
+
+
+
+  //printf("publisher: %s, msg_def: %s, type: %s, topic: %s\n", publisher_name.c_str(), mdef.c_str(), mtype.c_str(), mtopic.c_str());
+
+
+
+
+
+  //cout << *s;
+  //std::string mtype = header.mtype;
+  //it = header->find("message_definition");
+  //std::string mdef = header->mdef;//it->second;
+
+  //printf("\npublisher: %s, msg_def: %s, type: %s, topic: %s\n\n", publisher_name.c_str(), mdef.c_str(), mtype.c_str(), mtopic.c_str());
+  /*ROS_INFO("Got a cloud on topic %s in frame %s with %d points!",
+           topic.c_str(),
+           input.header.frame_id.c_str(),
+           input.width*input.height);*/
+	 success = true;
+   } catch (topic_tools::ShapeShifterException& e)
+   {
+       //printf("Instantiate failed!\n");
+   }
+}
+
+string get_xml_element (string xmltext, string tag){
+
+	size_t pos1, pos2;
+	string ex_tag = "<" + tag + ">";
+	string ex_tag_e = "</" + tag + ">";
+	pos1 = xmltext.find(ex_tag)+ex_tag.size();
+	pos2 = xmltext.find(ex_tag_e);
+	if (pos1 < 0)
+		return "-1";
+	else
+		return xmltext.substr(pos1, pos2-pos1);
+
+}
+
+void split(const string& str, const string& delim, vector<string>& parts) {
+  size_t start, end = 0;
+  while (end < str.size()) {
+    start = end;
+    while (start < str.size() && (delim.find(str[start]) != string::npos)) {
+      start++;  // skip initial whitespace
+    }
+    end = start;
+    while (end < str.size() && (delim.find(str[end]) == string::npos)) {
+      end++; // skip to end of word
+    }
+    if (end-start != 0) {  // just ignore zero-length strings.
+      parts.push_back(string(str, start, end-start));
+    }
+  }
+}
+
+
+
+int main(int argc, char **argv)
+{
+
+
+  Node client1;
+
+  std::vector<Node>::iterator it;
+
+  //std::vector<std::string> glistens = client1.getListens();
+  //ROS_INFO("%s", glistens[0].c_str());
+  ros::init(argc, argv, "talker");
+  ros::NodeHandle n;
+  ros::NodeHandle nodeHandler;
+
+  ros::V_Subscriber subs_;
+  ros::V_Publisher pubs_;
+
+  ros::Publisher parray [50];
+  ros::Publisher sarray [50];
+  ros::Publisher chatter_pub = n.advertise<std_msgs::String>("chatter", 1000);
+
+  ros::Publisher cpub2 = n.advertise<sensor_msgs::LaserScan>("masschat", 1000);
+  //ros::Publisher cpub = n.advertise<std_msgs::String>("masschat", 1000);
+  //ros::Publisher cpub = n.advertise<std_msgs::Float32>("masschat", 1000);
+
+  //ros::Subscriber sub = n.subscribe<topic_tools::ShapeShifter>("masschat",1,&messageCallbackLoopback);
+  ros::Subscriber sub = n.subscribe<topic_tools::ShapeShifter>("masschat",1,&callback);
+  //ros::Subscriber sub = n.subscribe<topic_tools::ShapeShifter>("my_topic", 1, incomingData());
+  ros::Rate loop_rate(1);
+  //ROS_INFO("1\n");
+
+  std::string msgback;
+  int pi = 0;
+  int sfd, s;
+  int efd;
+  struct epoll_event event;
+  struct epoll_event *events;
+
+  if (argc != 2)
+    {
+      fprintf (stderr, "Usage: %s [port]\n", argv[0]);
+      exit (EXIT_FAILURE);
+    }
+
+  sfd = create_and_bind (argv[1]);
+  if (sfd == -1)
+    abort ();
+
+  s = make_socket_non_blocking (sfd);
+  if (s == -1)
+    abort ();
+
+  s = listen (sfd, SOMAXCONN);
+  if (s == -1)
+    {
+      perror ("listen");
+      abort ();
+    }
+
+  efd = epoll_create1 (0);
+  if (efd == -1)
+    {
+      perror ("epoll_create");
+      abort ();
+    }
+
+  event.data.fd = sfd;
+  event.events = EPOLLIN | EPOLLET;
+  s = epoll_ctl (efd, EPOLL_CTL_ADD, sfd, &event);
+  if (s == -1)
+    {
+      perror ("epoll_ctl");
+      abort ();
+    }
+
+  /* Buffer where events are returned */
+  events = (epoll_event*)calloc (MAXEVENTS, sizeof event);
+  int counter=0;
+  /* The event loop */
+  while (ros::ok())
+  {
+	  int n, i;
+
+	        n = epoll_wait (efd, events, MAXEVENTS, 0);
+	        for (i = 0; i < n; i++)
+	  	{
+	  	  if ((events[i].events & EPOLLERR) ||
+	                (events[i].events & EPOLLHUP) ||
+	                (!(events[i].events & EPOLLIN)))
+	  	    {
+	                /* An error has occured on this fd, or the socket is not
+	                   ready for reading (why were we notified then?) */
+	  	      fprintf (stderr, "epoll error\n");
+	  	      close (events[i].data.fd);
+	  	      continue;
+	  	    }
+
+	  	  else if (sfd == events[i].data.fd)
+	  	    {
+	                /* We have a notification on the listening socket, which
+	                   means one or more incoming connections. */
+	                while (1)
+	                  {
+	                    struct sockaddr in_addr;
+	                    socklen_t in_len;
+	                    int infd;
+	                    char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
+
+	                    in_len = sizeof in_addr;
+	                    infd = accept (sfd, &in_addr, &in_len);
+	                    if (infd == -1)
+	                      {
+	                        if ((errno == EAGAIN) ||
+	                            (errno == EWOULDBLOCK))
+	                          {
+	                            /* We have processed all incoming
+	                               connections. */
+	                            break;
+	                          }
+	                        else
+	                          {
+	                            perror ("accept");
+	                            break;
+	                          }
+	                      }
+
+	                    s = getnameinfo (&in_addr, in_len,
+	                                     hbuf, sizeof hbuf,
+	                                     sbuf, sizeof sbuf,
+	                                     NI_NUMERICHOST | NI_NUMERICSERV);
+	                    if (s == 0)
+	                      {
+	                        printf("Accepted connection on descriptor %d "
+	                               "(host=%s, port=%s)\n", infd, hbuf, sbuf);
+
+	                        std::string wlcm = "Welcome to ROSWIN Server\n";
+	                        write (infd, wlcm.c_str(), wlcm.length());
+	                        Node client1 (infd);
+	                        clients.push_back(client1);
+	                      }
+
+	                    /* Make the incoming socket non-blocking and add it to the
+	                       list of fds to monitor. */
+	                    s = make_socket_non_blocking (infd);
+	                    if (s == -1)
+	                      abort ();
+
+	                    event.data.fd = infd;
+	                    event.events = EPOLLIN | EPOLLET;
+	                    s = epoll_ctl (efd, EPOLL_CTL_ADD, infd, &event);
+	                    if (s == -1)
+	                      {
+	                        perror ("epoll_ctl");
+	                        abort ();
+	                      }
+	                  }
+	                continue;
+	              }
+	            else
+	              {
+	                /* We have data on the fd waiting to be read. Read and
+	                   display it. We must read whatever data is available
+	                   completely, as we are running in edge-triggered mode
+	                   and won't get a notification again for the same
+	                   data. */
+	                int done = 0;
+
+	                while (1)
+	                  {
+	                    ssize_t count;
+	                    char buf[512];
+
+	                    count = read (events[i].data.fd, buf, sizeof buf);
+	                    if (count == -1)
+	                      {
+	                        /* If errno == EAGAIN, that means we have read all
+	                           data. So go back to the main loop. */
+	                        if (errno != EAGAIN)
+	                          {
+	                            perror ("read");
+	                            done = 1;
+	                          }
+	                        break;
+	                      }
+	                    else if (count == 0)
+	                      {
+	                        /* End of file. The remote has closed the
+	                           connection. */
+	                        done = 1;
+	                        break;
+	                      }
+
+	                    s = write (1, buf, count);
+	                    msg.data.assign(buf,count);
+
+	                    it = std::find(clients.begin(), clients.end(), Node(events[i].data.fd) );
+	                    //cout << "it: " << it->getSocketID() << " len" << strlen(buf) << endl;
+	                    std::string client_msg( reinterpret_cast<char const*>(buf), count ) ;
+	                    client_msg.erase( std::remove(client_msg.begin(), client_msg.end(), '\r'), client_msg.end() );
+	                    client_msg.erase( std::remove(client_msg.begin(), client_msg.end(), '\n'), client_msg.end() );
+
+	                    if (client_msg.find("<SMFPacket>") < 0 || client_msg.find("</SMFPacket>") < 0)
+	                    {
+	                    	msgback = "Not a valid SMF packet!\n";
+							write (events[i].data.fd, msgback.c_str(), msgback.length());
+	                    }
+	                    else
+	                    {
+							string msg_id = get_xml_element(client_msg, "ID");
+							//cout << "msgid " << msg_id << endl;
+
+							string msgtype = get_xml_element(client_msg, "Type");
+							//cout << "msgtype " << msgtype << endl;
+
+							string msgdata = get_xml_element(client_msg, "Data");
+							//cout << "msgdata " << msgdata << endl;
+
+							string msglistens = get_xml_element(client_msg, "Listens");
+							//cout << "msglistens " << msglistens << endl;
+
+							vector<string> topics;
+							split(msglistens, ",", topics);
+
+							if (topics.size()>0)
+							{
+								it->clearListens();
+								for(std::vector<std::string>::size_type i = 0; i != topics.size(); i++) {
+									it->addListen(topics[i]);
+								}
+							}
+
+							if (msg_id == "-1")
+							{
+								it->setNodeID(msg_id);
+							}
+
+							string msgtimestamp = get_xml_element(client_msg, "TimeStamp");
+
+							distributeMessage(msgtype,msgdata,msgtimestamp,events[i].data.fd);
+
+							//cout << "msgtimestamp " << msgtimestamp << endl;
+
+							//it->addListen(topicname);
+
+							/*if (pi<=49){
+							parray[pi] = nodeHandler.advertise<std_msgs::String>(msg.data, 1000);
+							pi++;
+							}*/
+							/*if (si<=49){
+							sarray[si] = nodeHandler.subscribe<std_msgs::String>("my_topic", 1, Foo());
+							si++;
+							}*/
+
+							//chatter_pub.publish(msg);
+	                    }
+
+	                    if (s == -1)
+	                      {
+	                        perror ("write");
+	                        abort ();
+	                      }
+	                  }
+
+	                if (done)
+	                  {
+	                    printf ("Closed connection on descriptor %d\n",
+	                            events[i].data.fd);
+
+	                    /* Closing the descriptor will make epoll remove it
+	                       from the set of descriptors which are monitored. */
+	                    close (events[i].data.fd);
+	                    it = std::find(clients.begin(), clients.end(), Node(events[i].data.fd) );
+	                    clients.erase(it);
+	                  }
+	              }
+	          }
+	  	//printf("count: %d \n", counter);
+		sensor_msgs::LaserScan cpubmsg;
+	    std_msgs::String msgs;
+	    //std_msgs::Float32 msgs;
+		std::stringstream ss;
+		ss << "hello" << counter;
+		msgs.data = ss.str();
+		cpubmsg.angle_max = -1;
+		cpubmsg.range_max = 2;
+	    //msgs.data = (float)counter;
+		//cpub.publish(msgs);
+		cpub2.publish(cpubmsg);
+	  	counter++;
+
+	  	/*printf("listens count: %d \n", clients.size());
+	  	for(std::vector<Node>::size_type i = 0; i != clients.size(); i++) {
+	  		    cout << clients[i].getSocketID() << endl;
+	  		    clients[i].listListens();
+	  		}*/
+
+
+    ros::spinOnce();
+    loop_rate.sleep();
+  }
+
+  free (events);
+
+  close (sfd);
+
+  return EXIT_SUCCESS;
+}
